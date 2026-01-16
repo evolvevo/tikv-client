@@ -11,6 +11,9 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 
+use crate::Error;
+use crate::Result;
+use crate::SecurityManager;
 use crate::pd::Cluster;
 use crate::pd::Connection;
 use crate::proto::keyspacepb;
@@ -21,9 +24,6 @@ use crate::region::RegionId;
 use crate::region::RegionWithLeader;
 use crate::region::StoreId;
 use crate::stats::pd_stats;
-use crate::Error;
-use crate::Result;
-use crate::SecurityManager;
 
 // FIXME: these numbers and how they are used are all just cargo-culted in, there
 // may be more optimal values.
@@ -139,6 +139,11 @@ impl RetryClient<Cluster> {
             timeout,
         })
     }
+
+    /// Get the cluster ID.
+    pub async fn get_cluster_id(&self) -> u64 {
+        self.cluster.read().await.0.id()
+    }
 }
 
 #[async_trait]
@@ -252,9 +257,9 @@ impl Reconnect for RetryClient<Cluster> {
 
 #[cfg(test)]
 mod test {
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
-    use std::sync::Mutex;
 
     use futures::executor;
     use futures::future::ready;

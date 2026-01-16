@@ -9,18 +9,18 @@ use async_trait::async_trait;
 use log::error;
 use log::info;
 use log::warn;
-use tonic::transport::Channel;
 use tonic::IntoRequest;
 use tonic::Request;
+use tonic::transport::Channel;
 
 use super::timestamp::TimestampOracle;
-use crate::internal_err;
-use crate::proto::keyspacepb;
-use crate::proto::pdpb;
 use crate::Error;
 use crate::Result;
 use crate::SecurityManager;
 use crate::Timestamp;
+use crate::internal_err;
+use crate::proto::keyspacepb;
+use crate::proto::pdpb;
 
 /// A PD cluster.
 pub struct Cluster {
@@ -29,6 +29,13 @@ pub struct Cluster {
     keyspace_client: keyspacepb::keyspace_client::KeyspaceClient<Channel>,
     members: pdpb::GetMembersResponse,
     tso: TimestampOracle,
+}
+
+impl Cluster {
+    /// Get the cluster ID.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
 }
 
 macro_rules! pd_request {

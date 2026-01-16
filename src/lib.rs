@@ -93,6 +93,7 @@
 #![allow(clippy::field_reassign_with_default)]
 
 pub mod backoff;
+pub mod cdc;
 #[doc(hidden)]
 pub mod raw;
 pub mod request;
@@ -162,3 +163,17 @@ pub use crate::transaction::Snapshot;
 pub use crate::transaction::Transaction;
 #[doc(inline)]
 pub use crate::transaction::TransactionOptions;
+
+// CDC exports
+#[doc(inline)]
+pub use crate::cdc::CdcClient;
+#[doc(inline)]
+pub use crate::cdc::CdcError;
+#[doc(inline)]
+pub use crate::cdc::CdcEvent;
+#[doc(inline)]
+pub use crate::cdc::CdcOptions;
+#[doc(inline)]
+pub use crate::cdc::RowChange;
+#[doc(inline)]
+pub use crate::cdc::RowOp;
