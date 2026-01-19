@@ -166,7 +166,8 @@ impl CdcClient {
     /// Get or create a CDC client for a store.
     async fn get_cdc_client(&self, address: &str) -> Result<ChangeDataClient<Channel>> {
         // Check cache first (lock-free read)
-        let guard = self.cdc_clients.pin();
+        // Use pin_owned() to get a Send guard that can be held across await points
+        let guard = self.cdc_clients.pin_owned();
         if let Some(client) = guard.get(address) {
             return Ok(client.clone());
         }
@@ -180,7 +181,7 @@ impl CdcClient {
 
         // Cache the client
         self.cdc_clients
-            .pin()
+            .pin_owned()
             .insert(address.to_string(), client.clone());
 
         Ok(client)
