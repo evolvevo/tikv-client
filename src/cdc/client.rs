@@ -2,8 +2,8 @@
 
 //! CDC client implementation.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use futures::channel::mpsc;
 use futures::prelude::*;
@@ -13,10 +13,6 @@ use papaya::HashMap;
 use tonic::transport::Channel;
 
 use super::event::CdcEvent;
-use crate::BoundRange;
-use crate::Key;
-use crate::Result;
-use crate::SecurityManager;
 use crate::config::Config;
 use crate::pd::RetryClient;
 use crate::pd::RetryClientTrait;
@@ -24,6 +20,10 @@ use crate::proto::cdcpb::change_data_client::ChangeDataClient;
 use crate::proto::cdcpb::change_data_request::{KvApi, Register, Request};
 use crate::proto::cdcpb::{ChangeDataRequest, Header};
 use crate::region::RegionWithLeader;
+use crate::BoundRange;
+use crate::Key;
+use crate::Result;
+use crate::SecurityManager;
 
 /// CDC client version string.
 /// TiKV requires a minimum version of 6.2.0 for CDC compatibility.
@@ -86,6 +86,54 @@ impl CdcOptions {
     }
 }
 
+/// Configuration for CDC client gRPC connection settings.
+///
+/// Controls message size limits for the gRPC channel used by CDC streams.
+/// Use `0` for any limit to indicate unlimited (will use `usize::MAX`).
+#[derive(Debug, Clone)]
+pub struct CdcConfig {
+    /// Maximum size of decoded (incoming) gRPC messages in bytes.
+    /// Default: 64MB. Set to 0 for unlimited.
+    pub max_decoding_message_size: usize,
+    /// Maximum size of encoded (outgoing) gRPC messages in bytes.
+    /// Default: 0 (unlimited).
+    pub max_encoding_message_size: usize,
+}
+
+impl Default for CdcConfig {
+    fn default() -> Self {
+        Self {
+            max_decoding_message_size: 64 * 1024 * 1024, // 64MB
+            max_encoding_message_size: 0,                // unlimited
+        }
+    }
+}
+
+impl CdcConfig {
+    /// Set the maximum size of decoded (incoming) gRPC messages.
+    /// Use 0 for unlimited.
+    pub fn with_max_decoding_message_size(mut self, size: usize) -> Self {
+        self.max_decoding_message_size = size;
+        self
+    }
+
+    /// Set the maximum size of encoded (outgoing) gRPC messages.
+    /// Use 0 for unlimited.
+    pub fn with_max_encoding_message_size(mut self, size: usize) -> Self {
+        self.max_encoding_message_size = size;
+        self
+    }
+
+    /// Resolve a size value: 0 means unlimited (usize::MAX).
+    fn resolve_size(size: usize) -> usize {
+        if size == 0 {
+            usize::MAX
+        } else {
+            size
+        }
+    }
+}
+
 /// A CDC client for subscribing to change events from TiKV.
 ///
 /// This client connects to the TiKV cluster via PD and sets up CDC streams
@@ -97,6 +145,10 @@ pub struct CdcClient {
     request_id_counter: AtomicU64,
     /// Connected CDC clients per store address (read-heavy, rarely written)
     cdc_clients: HashMap<String, ChangeDataClient<Channel>>,
+    /// Maximum size of decoded (incoming) gRPC messages
+    max_decoding_message_size: usize,
+    /// Maximum size of encoded (outgoing) gRPC messages
+    max_encoding_message_size: usize,
 }
 
 impl CdcClient {
@@ -116,13 +168,28 @@ impl CdcClient {
     /// # });
     /// ```
     pub async fn new<S: Into<String>>(pd_endpoints: Vec<S>) -> Result<Self> {
-        Self::new_with_config(pd_endpoints, Config::default()).await
+        Self::new_with_cdc_config(pd_endpoints, Config::default(), CdcConfig::default()).await
     }
 
-    /// Create a new CDC client with custom configuration.
+    /// Create a new CDC client with custom TiKV configuration.
     pub async fn new_with_config<S: Into<String>>(
         pd_endpoints: Vec<S>,
         config: Config,
+    ) -> Result<Self> {
+        Self::new_with_cdc_config(pd_endpoints, config, CdcConfig::default()).await
+    }
+
+    /// Create a new CDC client with custom TiKV and CDC configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `pd_endpoints` - The PD endpoints to connect to.
+    /// * `config` - TiKV client configuration (TLS, timeouts, etc.)
+    /// * `cdc_config` - CDC-specific configuration (message size limits)
+    pub async fn new_with_cdc_config<S: Into<String>>(
+        pd_endpoints: Vec<S>,
+        config: Config,
+        cdc_config: CdcConfig,
     ) -> Result<Self> {
         info!("Creating CDC client");
         let pd_endpoints: Vec<String> = pd_endpoints.into_iter().map(Into::into).collect();
@@ -150,6 +217,12 @@ impl CdcClient {
             cluster_id,
             request_id_counter: AtomicU64::new(1),
             cdc_clients: HashMap::new(),
+            max_decoding_message_size: CdcConfig::resolve_size(
+                cdc_config.max_decoding_message_size,
+            ),
+            max_encoding_message_size: CdcConfig::resolve_size(
+                cdc_config.max_encoding_message_size,
+            ),
         })
     }
 
@@ -178,6 +251,11 @@ impl CdcClient {
             .security_mgr
             .connect(address, ChangeDataClient::new)
             .await?;
+
+        // Apply gRPC message size limits
+        let client = client
+            .max_decoding_message_size(self.max_decoding_message_size)
+            .max_encoding_message_size(self.max_encoding_message_size);
 
         // Cache the client
         self.cdc_clients

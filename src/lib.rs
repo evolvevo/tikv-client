@@ -168,6 +168,8 @@ pub use crate::transaction::TransactionOptions;
 #[doc(inline)]
 pub use crate::cdc::CdcClient;
 #[doc(inline)]
+pub use crate::cdc::CdcConfig;
+#[doc(inline)]
 pub use crate::cdc::CdcError;
 #[doc(inline)]
 pub use crate::cdc::CdcEvent;

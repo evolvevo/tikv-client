@@ -24,5 +24,5 @@
 mod client;
 mod event;
 
-pub use client::{CdcClient, CdcOptions};
+pub use client::{CdcClient, CdcConfig, CdcOptions};
 pub use event::{CdcError, CdcEvent, RowChange, RowOp};
