@@ -10,6 +10,7 @@ use tonic::transport::Channel;
 
 use super::Request;
 use crate::proto::tikvpb::tikv_client::TikvClient;
+use crate::Config;
 use crate::Result;
 use crate::SecurityManager;
 
@@ -24,7 +25,7 @@ pub trait KvConnect: Sized + Send + Sync + 'static {
 #[derive(new, Clone)]
 pub struct TikvConnect {
     security_mgr: Arc<SecurityManager>,
-    timeout: Duration,
+    config: Config,
 }
 
 #[async_trait]
@@ -33,9 +34,26 @@ impl KvConnect for TikvConnect {
 
     async fn connect(&self, address: &str) -> Result<KvRpcClient> {
         self.security_mgr
-            .connect(address, TikvClient::new)
+            .connect(address, |ch| {
+                // Apply gRPC message size limits from config
+                // 0 means unlimited (use usize::MAX)
+                let decoding_limit = if self.config.grpc_max_decoding_message_size == 0 {
+                    usize::MAX
+                } else {
+                    self.config.grpc_max_decoding_message_size
+                };
+                let encoding_limit = if self.config.grpc_max_encoding_message_size == 0 {
+                    usize::MAX
+                } else {
+                    self.config.grpc_max_encoding_message_size
+                };
+
+                TikvClient::new(ch)
+                    .max_decoding_message_size(decoding_limit)
+                    .max_encoding_message_size(encoding_limit)
+            })
             .await
-            .map(|c| KvRpcClient::new(c, self.timeout))
+            .map(|c| KvRpcClient::new(c, self.config.timeout))
     }
 }
 

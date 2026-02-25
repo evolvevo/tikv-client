@@ -20,9 +20,19 @@ pub struct Config {
     pub key_path: Option<PathBuf>,
     pub timeout: Duration,
     pub keyspace: Option<String>,
+    /// Maximum size of decoded (incoming) gRPC messages in bytes.
+    /// Default is 64MB. Set to 0 for unlimited.
+    pub grpc_max_decoding_message_size: usize,
+    /// Maximum size of encoded (outgoing) gRPC messages in bytes.
+    /// Default is unlimited (0).
+    pub grpc_max_encoding_message_size: usize,
 }
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// Default max decoding message size: 64MB
+const DEFAULT_GRPC_MAX_DECODING_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+/// Default max encoding message size: unlimited (0)
+const DEFAULT_GRPC_MAX_ENCODING_MESSAGE_SIZE: usize = 0;
 
 impl Default for Config {
     fn default() -> Self {
@@ -32,6 +42,8 @@ impl Default for Config {
             key_path: None,
             timeout: DEFAULT_REQUEST_TIMEOUT,
             keyspace: None,
+            grpc_max_decoding_message_size: DEFAULT_GRPC_MAX_DECODING_MESSAGE_SIZE,
+            grpc_max_encoding_message_size: DEFAULT_GRPC_MAX_ENCODING_MESSAGE_SIZE,
         }
     }
 }
@@ -100,6 +112,38 @@ impl Config {
     #[must_use]
     pub fn with_keyspace(mut self, keyspace: &str) -> Self {
         self.keyspace = Some(keyspace.to_owned());
+        self
+    }
+
+    /// Set the maximum size of decoded (incoming) gRPC messages.
+    ///
+    /// This limits the size of responses that can be received from TiKV/PD.
+    /// The default is 64MB. Set to 0 for unlimited.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use tikv_client::Config;
+    /// let config = Config::default().with_grpc_max_decoding_message_size(128 * 1024 * 1024); // 128MB
+    /// ```
+    #[must_use]
+    pub fn with_grpc_max_decoding_message_size(mut self, size: usize) -> Self {
+        self.grpc_max_decoding_message_size = size;
+        self
+    }
+
+    /// Set the maximum size of encoded (outgoing) gRPC messages.
+    ///
+    /// This limits the size of requests that can be sent to TiKV/PD.
+    /// The default is unlimited (0).
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use tikv_client::Config;
+    /// let config = Config::default().with_grpc_max_encoding_message_size(64 * 1024 * 1024); // 64MB
+    /// ```
+    #[must_use]
+    pub fn with_grpc_max_encoding_message_size(mut self, size: usize) -> Self {
+        self.grpc_max_encoding_message_size = size;
         self
     }
 }
