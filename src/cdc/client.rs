@@ -10,6 +10,7 @@ use futures::prelude::*;
 use futures::stream::BoxStream;
 use log::{debug, info, warn};
 use papaya::HashMap;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 
 use super::event::CdcEvent;
@@ -138,6 +139,9 @@ impl CdcConfig {
 ///
 /// This client connects to the TiKV cluster via PD and sets up CDC streams
 /// to receive change events for specified key ranges or all data.
+///
+/// When the client is dropped, all spawned subscription tasks are cancelled
+/// to prevent resource leaks.
 pub struct CdcClient {
     pd: Arc<RetryClient>,
     security_mgr: Arc<SecurityManager>,
@@ -149,6 +153,9 @@ pub struct CdcClient {
     max_decoding_message_size: usize,
     /// Maximum size of encoded (outgoing) gRPC messages
     max_encoding_message_size: usize,
+    /// Cancellation token for all spawned subscription tasks.
+    /// Cancelled when the client is dropped to prevent orphaned tasks.
+    cancellation: CancellationToken,
 }
 
 impl CdcClient {
@@ -223,6 +230,7 @@ impl CdcClient {
             max_encoding_message_size: CdcConfig::resolve_size(
                 cdc_config.max_encoding_message_size,
             ),
+            cancellation: CancellationToken::new(),
         })
     }
 
@@ -345,9 +353,11 @@ impl CdcClient {
             // Spawn a task to handle this region's subscription
             let tx = tx.clone();
             let client = self.get_cdc_client(&store_addr).await?;
+            let cancel = self.cancellation.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_region_subscription(client, request, tx.clone()).await
+                if let Err(e) =
+                    Self::handle_region_subscription(client, request, tx.clone(), cancel).await
                 {
                     warn!("CDC subscription error for region: {:?}", e);
                     let _ = tx.unbounded_send(Err(e));
@@ -363,6 +373,7 @@ impl CdcClient {
         mut client: ChangeDataClient<Channel>,
         request: ChangeDataRequest,
         tx: mpsc::UnboundedSender<Result<CdcEvent>>,
+        cancellation: CancellationToken,
     ) -> Result<()> {
         let region_id = request.region_id;
         debug!("Starting CDC subscription for region {}", region_id);
@@ -383,22 +394,38 @@ impl CdcClient {
         // Keep req_tx alive to prevent the stream from closing
         let _req_tx = req_tx;
 
-        // Process events
-        while let Some(event_result) = event_stream.next().await {
-            match event_result {
-                Ok(event) => {
-                    let cdc_events = CdcEvent::from_raw(event);
-                    for cdc_event in cdc_events {
-                        if tx.unbounded_send(Ok(cdc_event)).is_err() {
-                            // Receiver dropped, stop processing
-                            return Ok(());
+        // Process events until cancelled or stream ends
+        loop {
+            tokio::select! {
+                // Check for cancellation first (biased)
+                biased;
+
+                _ = cancellation.cancelled() => {
+                    debug!("CDC subscription for region {} cancelled", region_id);
+                    break;
+                }
+
+                event = event_stream.next() => {
+                    match event {
+                        Some(Ok(event)) => {
+                            let cdc_events = CdcEvent::from_raw(event);
+                            for cdc_event in cdc_events {
+                                if tx.unbounded_send(Ok(cdc_event)).is_err() {
+                                    // Receiver dropped, stop processing
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            warn!("CDC stream error for region {}: {:?}", region_id, e);
+                            let _ = tx.unbounded_send(Err(e.into()));
+                            break;
+                        }
+                        None => {
+                            // Stream ended
+                            break;
                         }
                     }
-                }
-                Err(e) => {
-                    warn!("CDC stream error for region {}: {:?}", region_id, e);
-                    let _ = tx.unbounded_send(Err(e.into()));
-                    break;
                 }
             }
         }
@@ -434,5 +461,16 @@ impl CdcClient {
         }
 
         Ok(regions)
+    }
+}
+
+impl Drop for CdcClient {
+    fn drop(&mut self) {
+        // Cancel all spawned subscription tasks to prevent resource leaks.
+        // This ensures that when a CdcClient is dropped (e.g., during reconnection),
+        // all the region subscription tasks are properly terminated instead of
+        // being orphaned with open gRPC connections.
+        debug!("Dropping CdcClient, cancelling all subscription tasks");
+        self.cancellation.cancel();
     }
 }
