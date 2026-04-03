@@ -4,6 +4,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::channel::mpsc;
 use futures::prelude::*;
@@ -344,7 +345,7 @@ impl CdcClient {
                 start_key: region_start,
                 end_key: region_end,
                 request_id: self.next_request_id(),
-                extra_op: 0,
+                extra_op: 1, // ReadOldValue: request old values for correct Create vs Update classification
                 kv_api: options.kv_api as i32,
                 filter_loop: options.filter_loop,
                 request: Some(Request::Register(Register {})),
@@ -368,7 +369,7 @@ impl CdcClient {
         Ok(rx.boxed())
     }
 
-    /// Handle a single region's CDC subscription.
+    /// Handle a single region's CDC subscription with automatic retry.
     async fn handle_region_subscription(
         mut client: ChangeDataClient<Channel>,
         request: ChangeDataRequest,
@@ -376,62 +377,76 @@ impl CdcClient {
         cancellation: CancellationToken,
     ) -> Result<()> {
         let region_id = request.region_id;
-        debug!("Starting CDC subscription for region {}", region_id);
+        let initial_backoff = Duration::from_secs(1);
+        let max_backoff = Duration::from_secs(30);
+        let mut backoff = initial_backoff;
 
-        // Create a channel for sending requests - we send the initial register request
-        // and keep the stream open for potential future requests (like NotifyTxnStatus)
-        let (req_tx, req_rx) = mpsc::unbounded::<ChangeDataRequest>();
-
-        // Send the initial registration request
-        req_tx
-            .unbounded_send(request)
-            .map_err(|e| crate::Error::StringError(format!("Failed to send CDC request: {}", e)))?;
-
-        // Start the bi-directional stream with the receiver as the request stream
-        let response = client.event_feed(req_rx).await?;
-        let mut event_stream = response.into_inner();
-
-        // Keep req_tx alive to prevent the stream from closing
-        let _req_tx = req_tx;
-
-        // Process events until cancelled or stream ends
         loop {
-            tokio::select! {
-                // Check for cancellation first (biased)
-                biased;
+            if cancellation.is_cancelled() {
+                return Ok(());
+            }
 
-                _ = cancellation.cancelled() => {
-                    debug!("CDC subscription for region {} cancelled", region_id);
-                    break;
-                }
+            debug!("subscribing to CDC for region {}", region_id);
 
-                event = event_stream.next() => {
-                    match event {
-                        Some(Ok(event)) => {
-                            let cdc_events = CdcEvent::from_raw(event);
-                            for cdc_event in cdc_events {
-                                if tx.unbounded_send(Ok(cdc_event)).is_err() {
-                                    // Receiver dropped, stop processing
-                                    return Ok(());
+            let (req_tx, req_rx) = mpsc::unbounded::<ChangeDataRequest>();
+            if req_tx.unbounded_send(request.clone()).is_err() {
+                return Ok(());
+            }
+
+            match client.event_feed(req_rx).await {
+                Ok(response) => {
+                    backoff = initial_backoff;
+                    let mut event_stream = response.into_inner();
+                    let _req_tx = req_tx;
+
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = cancellation.cancelled() => return Ok(()),
+                            event = event_stream.next() => {
+                                match event {
+                                    Some(Ok(raw)) => {
+                                        let mut got_error = false;
+                                        for cdc_event in CdcEvent::from_raw(raw) {
+                                            if let CdcEvent::Error { region_id: rid, ref error } = cdc_event {
+                                                warn!("CDC error for region {}: {}", rid, error);
+                                                let _ = tx.unbounded_send(Ok(cdc_event));
+                                                got_error = true;
+                                                break;
+                                            }
+                                            if tx.unbounded_send(Ok(cdc_event)).is_err() {
+                                                return Ok(());
+                                            }
+                                        }
+                                        if got_error {
+                                            break;
+                                        }
+                                    }
+                                    Some(Err(e)) => {
+                                        warn!("CDC stream error for region {}: {:?}", region_id, e);
+                                        break;
+                                    }
+                                    None => {
+                                        debug!("CDC stream ended for region {}", region_id);
+                                        break;
+                                    }
                                 }
                             }
                         }
-                        Some(Err(e)) => {
-                            warn!("CDC stream error for region {}: {:?}", region_id, e);
-                            let _ = tx.unbounded_send(Err(e.into()));
-                            break;
-                        }
-                        None => {
-                            // Stream ended
-                            break;
-                        }
                     }
                 }
+                Err(e) => {
+                    warn!("CDC event_feed failed for region {}: {:?}", region_id, e);
+                }
             }
-        }
 
-        debug!("CDC subscription ended for region {}", region_id);
-        Ok(())
+            if cancellation.is_cancelled() {
+                return Ok(());
+            }
+            debug!("retrying CDC for region {} in {:?}", region_id, backoff);
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(max_backoff);
+        }
     }
 
     /// Get all regions that overlap with the given key range.
